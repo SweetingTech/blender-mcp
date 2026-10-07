@@ -798,10 +798,11 @@ The system uses a simple JSON-based protocol over TCP sockets:
 
 ### Shared editor context in this fork
 
-This fork adds explicit captured bone context, native RNA discovery, guarded
-pose/edit-bone transforms and receipt-based compensation. See
+This fork adds a generic companion interface for live workspace/editor context,
+native entity/RNA/operator discovery, guarded native property and operator actions,
+and retained outcome/readback/compensation. See
 [the workflow, supported coverage and test boundaries](docs/SHARED_EDITOR_CONTEXT.md).
-The feature does not expose every Blender control; scoped bone edits default off.
+The feature does not claim every Blender control; companion permissions default off.
 
 Telemetry is **opt-in**. Collection of your content is off by default and stays off until you explicitly turn it on.
 

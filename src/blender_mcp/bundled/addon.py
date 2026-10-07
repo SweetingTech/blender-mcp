@@ -29,270 +29,552 @@ from contextlib import contextmanager, redirect_stdout, suppress
 from bpy.app.handlers import persistent
 
 class LiveEditorContext:
-    """Main-thread, session-only selection captures and guarded bone edits.
+    """Main-thread companion surface over native RNA, not a second scene engine."""
 
-    Names are labels, not identity. Captures retain pointer identities, a document
-    epoch and a selection serial. No RNA references survive a sample or edit.
-    """
-
-    LIMIT = 32
+    CAPTURE_LIMIT = 32
+    REFERENCE_LIMIT = 512
+    REQUEST_LIMIT = 64
+    OPERATOR_NAMESPACES = {'object', 'mesh', 'curve', 'surface', 'pose', 'armature',
+                           'transform', 'node', 'material', 'collection', 'view3d', 'screen'}
+    BLOCKED_OPERATOR_WORDS = {'screenshot', 'save', 'open', 'load', 'export', 'import', 'render',
+                              'bake', 'script', 'addon', 'url', 'path', 'quit', 'userpref', 'area_dupli'}
+    BLOCKED_PROPERTIES = {'filepath', 'filepath_raw', 'directory', 'use_scripts_auto_execute',
+                          'script_directory', 'script_directories', 'expression'}
 
     def __init__(self):
         self.epoch = uuid.uuid4().hex
         self.serial = 0
-        self.document = None
-        self.signature = None
-        self.captures = {}
-        self.receipts = {}
-        self.requests = {}
+        self.document = self.signature = None
+        self.signatures = {}
+        self.captures, self.references, self.requests = {}, {}, {}
 
     @staticmethod
-    def _digest(value):
-        return hashlib.sha256(json.dumps(value, sort_keys=True, allow_nan=False).encode()).hexdigest()
-
-    @staticmethod
-    def _copy(value):
+    def copy(value):
         return json.loads(json.dumps(value, allow_nan=False))
 
     @staticmethod
-    def _error(code):
+    def digest(value):
+        return hashlib.sha256(json.dumps(value, sort_keys=True, allow_nan=False).encode()).hexdigest()
+
+    @staticmethod
+    def error(code):
         raise ValueError(code)
 
     def invalidate(self):
         self.epoch = uuid.uuid4().hex
         self.document = self.signature = None
+        self.signatures.clear()
         self.captures.clear()
-        self.receipts.clear()
+        self.references.clear()
         self.requests.clear()
 
+    @staticmethod
+    def identity(value):
+        return None if value is None else value.as_pointer()
+
     def sample(self, context):
-        scene = context.scene
-        obj = context.view_layer.objects.active
-        document = (bpy.data.filepath, scene.as_pointer(), context.view_layer.as_pointer())
+        document = (bpy.data.filepath,)
         if self.document is not None and document != self.document:
             self.invalidate()
         self.document = document
-        mode = context.mode
-        selected = sorted((o.name, o.as_pointer()) for o in context.selected_objects)
-        bones, active = [], None
+        obj = context.view_layer.objects.active
+        selected = sorted((o.name, self.identity(o)) for o in context.selected_objects)
+        bones, active_bone = [], None
         if obj is not None and obj.type == 'ARMATURE':
-            collection = obj.data.edit_bones if mode == 'EDIT_ARMATURE' else obj.data.bones
-            bones = sorted((b.name, b.as_pointer()) for b in collection if b.select)
-            active = collection.active
-        target = None
-        if active is not None and active.select and mode in {'POSE', 'EDIT_ARMATURE'}:
-            target = {'kind': 'pose_bone' if mode == 'POSE' else 'edit_bone',
-                      'object': obj.name, 'object_identity': obj.as_pointer(),
-                      'armature_identity': obj.data.as_pointer(),
-                      'bone': active.name, 'bone_identity': active.as_pointer()}
-        signature = (document, mode, None if obj is None else (obj.name, obj.as_pointer()), selected, bones,
-                     None if active is None else (active.name, active.as_pointer()))
-        signature = self._copy(signature)
-        if signature != self.signature:
+            collection = obj.data.edit_bones if context.mode == 'EDIT_ARMATURE' else obj.data.bones
+            bones = sorted((b.name, self.identity(b)) for b in collection if b.select)
+            active_bone = collection.active
+        signature = self.copy((document, context.mode, self.identity(obj), selected, bones, self.identity(active_bone)))
+        source = (self.identity(context.scene), self.identity(context.view_layer))
+        previous = self.signatures.get(source)
+        if previous is None or signature != previous[0]:
             self.serial += 1
-            self.signature = signature
-        state = {'epoch': self.epoch, 'selection_serial': self.serial,
-                 'file': bpy.data.filepath, 'scene': scene.name, 'mode': mode,
-                 'scene_identity': scene.as_pointer(), 'view_layer': context.view_layer.name,
-                 'active_object': None if obj is None else obj.name,
-                 'selected_objects': [name for name, _ in selected],
-                 'selected_bones': [name for name, _ in bones], 'target': target,
-                 'scoped_bone_edits_enabled': bool(getattr(scene, 'blendermcp_allow_bone_edits', False)),
-                 'supported': ['object_selection', 'active_armature_bone', 'pose_location', 'edit_head_tail_roll'],
-                 'unsupported': ['mesh_subelements', 'focused_property', 'all_ui_controls', 'node_selection',
-                                 'utterance_timing', 'bone_rotation_scale', 'multi_object_armature_edit']}
-        if len([o for o in context.selected_objects if o.type == 'ARMATURE']) > 1:
-            state['target'] = None
-        if target is not None and state['target'] is not None:
-            _, bone = self.resolve(target, mode)
-            state['bone_state'] = self.read_bone(bone, mode)
-            state['bone_digest'] = self._digest(state['bone_state'])
-            state['bone_context'] = {
-                'parent': None if bone.parent is None else bone.parent.name,
-                'length': float(bone.length),
-                'constraints': [constraint.type for constraint in getattr(bone, 'constraints', ())],
-                'space': 'pose_local_channels' if mode == 'POSE' else 'armature_local',
-                'unit_scale': float(scene.unit_settings.scale_length),
+            self.signatures[source] = (signature, self.serial)
+        return {'epoch': self.epoch, 'selection_serial': self.signatures[source][1], 'file': bpy.data.filepath,
+                'scene_identity': source[0], 'view_layer_identity': source[1],
+                'scene': context.scene.name, 'view_layer': context.view_layer.name, 'mode': context.mode,
+                'active_object': None if obj is None else obj.name,
+                'selected_objects': [name for name, _ in selected],
+                'selected_bones': [name for name, _ in bones],
+                'active_bone': None if active_bone is None else active_bone.name,
+                'permissions': self.permissions(context)}
+
+    @staticmethod
+    def permissions(context):
+        return {'property_edit': bool(getattr(context.scene, 'blendermcp_allow_property_edits', False)),
+                'native_operator': bool(getattr(context.scene, 'blendermcp_allow_native_operators', False))}
+
+    def collections(self):
+        return sorted(prop.identifier for prop in bpy.data.bl_rna.properties if prop.type == 'COLLECTION')
+
+    def resolve_path(self, root, path):
+        value = root
+        if not isinstance(path, list) or len(path) > 8:
+            self.error('INVALID_NATIVE_PATH')
+        for segment in path:
+            if not isinstance(segment, dict) or len(segment) != 1:
+                self.error('INVALID_NATIVE_PATH')
+            if 'property' in segment:
+                name = segment['property']
+                if not isinstance(name, str) or name.startswith('_') or name not in value.bl_rna.properties:
+                    self.error('RNA_PROPERTY_NOT_FOUND')
+                value = getattr(value, name)
+            elif 'key' in segment:
+                if not isinstance(segment['key'], str) or len(segment['key']) > 256:
+                    self.error('INVALID_COLLECTION_KEY')
+                value = value.get(segment['key'])
+            elif 'index' in segment:
+                index = segment['index']
+                if isinstance(index, bool) or not isinstance(index, int) or index < 0 or index >= len(value):
+                    self.error('INVALID_COLLECTION_INDEX')
+                value = value[index]
+            else:
+                self.error('INVALID_NATIVE_PATH')
+            if value is None:
+                self.error('NATIVE_PATH_UNAVAILABLE')
+        if not hasattr(value, 'bl_rna') or not hasattr(value, 'as_pointer'):
+            self.error('PATH_MUST_RESOLVE_NATIVE_STRUCT')
+        return value
+
+    def reference(self, collection, name, path=None):
+        path = [] if path is None else path
+        if collection not in self.collections():
+            self.error('DATA_COLLECTION_NOT_FOUND')
+        root = getattr(bpy.data, collection).get(name)
+        if root is None:
+            self.error('DATABLOCK_NOT_FOUND')
+        value = self.resolve_path(root, path)
+        descriptor = {'epoch': self.epoch, 'collection': collection, 'name': name,
+                      'root_identity': self.identity(root), 'path': self.copy(path),
+                      'identity': self.identity(value), 'rna_type': value.bl_rna.identifier}
+        for key, existing in self.references.items():
+            if descriptor == existing:
+                return key, value
+        if len(self.references) >= self.REFERENCE_LIMIT:
+            self.error('REFERENCE_CAPACITY')
+        key = uuid.uuid4().hex
+        self.references[key] = descriptor
+        return key, value
+
+    def resolve(self, reference_id):
+        descriptor = self.references.get(reference_id)
+        if descriptor is None or descriptor['epoch'] != self.epoch:
+            self.error('REFERENCE_EXPIRED')
+        collection = getattr(bpy.data, descriptor['collection'])
+        root = collection.get(descriptor['name'])
+        # A rename may retain identity. A newly created same-name object may not.
+        if self.identity(root) != descriptor['root_identity']:
+            root = next((item for item in collection if self.identity(item) == descriptor['root_identity']), None)
+        if root is None:
+            self.error('TARGET_IDENTITY_CHANGED')
+        value = self.resolve_path(root, descriptor['path'])
+        if self.identity(value) != descriptor['identity']:
+            self.error('TARGET_IDENTITY_CHANGED')
+        return root, value
+
+    def serialize(self, value, prop):
+        if prop.type == 'COLLECTION':
+            return {'count': len(value), 'requires_path': True}
+        if prop.type == 'POINTER':
+            return None if value is None else {'rna_type': value.bl_rna.identifier,
+                                               'name': getattr(value, 'name', None), 'identity': self.identity(value)}
+        if getattr(prop, 'is_array', False):
+            if prop.array_length > 64:
+                return {'count': prop.array_length, 'unavailable': 'array_over_64'}
+            def array(item):
+                return item if isinstance(item, (bool, int, float)) else [array(v) for v in item]
+            return self.copy(array(value))
+        if isinstance(value, set):
+            return sorted(value)
+        if isinstance(value, str) and len(value.encode('utf-8')) > 4096:
+            return {'unavailable': 'string_over_4096_bytes'}
+        return self.copy(value)
+
+    def schema(self, prop):
+        return {'identifier': prop.identifier, 'type': prop.type,
+                'readonly': bool(prop.is_readonly), 'array_length': int(getattr(prop, 'array_length', 0)),
+                'array_dimensions': list(getattr(prop, 'array_dimensions', ())),
+                'enum_items': [item.identifier for item in prop.enum_items] if prop.type == 'ENUM' else [],
+                'property_edit_supported': prop.type in {'BOOLEAN', 'INT', 'FLOAT', 'STRING', 'ENUM'}
+                    and not prop.is_readonly and prop.identifier not in self.BLOCKED_PROPERTIES}
+
+    def inspect(self, context, collection=None, name=None, path=None, reference_id=None, properties=None):
+        self.sample(context)
+        if reference_id is None:
+            if not isinstance(collection, str) or not isinstance(name, str):
+                self.error('COLLECTION_AND_NAME_REQUIRED')
+            reference_id, value = self.reference(collection, name, path)
+        else:
+            _, value = self.resolve(reference_id)
+        schemas = [self.schema(prop) for prop in value.bl_rna.properties][:256]
+        result = {'reference_id': reference_id, 'reference': self.copy(self.references[reference_id]),
+                  'schemas': schemas, 'schemas_truncated': len(value.bl_rna.properties) > 256, 'properties': {}}
+        properties = [] if properties is None else properties
+        if not isinstance(properties, list) or len(properties) > 32:
+            self.error('PROPERTY_READ_LIMIT')
+        for key in properties:
+            prop = value.bl_rna.properties.get(key) if isinstance(key, str) else None
+            if prop is None or key.startswith('_'):
+                self.error('RNA_PROPERTY_NOT_FOUND')
+            observed = self.serialize(getattr(value, key), prop)
+            result['properties'][key] = {'value': observed, 'digest': self.digest(observed), 'schema': self.schema(prop)}
+        return result
+
+    def editor_rows(self):
+        rows = []
+        for window in bpy.context.window_manager.windows:
+            for area in window.screen.areas:
+                rows.append({'editor_key': f'{window.as_pointer()}:{area.as_pointer()}', 'type': area.type,
+                             'window_identity': window.as_pointer(), 'area_identity': area.as_pointer(),
+                             'workspace': window.workspace.name, 'screen': window.screen.name,
+                             'width': area.width, 'height': area.height})
+        return rows[:128]
+
+    def editor(self, editor_key):
+        for window in bpy.context.window_manager.windows:
+            for area in window.screen.areas:
+                if editor_key == f'{window.as_pointer()}:{area.as_pointer()}':
+                    return window, area
+        self.error('EDITOR_EXPIRED')
+
+    def workspace(self, context, editor_key=None):
+        if editor_key is None:
+            return self._workspace_native(context)
+        window, area = self.editor(editor_key)
+        region = next((r for r in area.regions if r.type == 'WINDOW'), None)
+        override = {'window': window, 'area': area}
+        if region is not None:
+            override['region'] = region
+        with context.temp_override(**override):
+            return self._workspace_native(context, editor_key)
+
+    def _workspace_native(self, context, editor_key=None):
+        state = self.sample(context)
+        state['editors'] = self.editor_rows()
+        state['data_collections'] = [{'name': key, 'count': len(getattr(bpy.data, key))} for key in self.collections()]
+        state['latest_capture_id'] = next(reversed(self.captures), None)
+        state['unsupported'] = ['complete_ui_widget_inventory', 'automatic_chat_timing', 'physical_click_history',
+                                'focused_property_outside_button_context', 'image_capture_atomicity',
+                                'mesh_subelement_stable_references', 'all_operator_transactions']
+        state['selection'] = []
+        for obj in list(context.selected_objects)[:128]:
+            ref, _ = self.reference('objects', obj.name)
+            state['selection'].append({'kind': 'object', 'reference_id': ref, 'name': obj.name})
+        obj = context.view_layer.objects.active
+        if obj is not None and obj.type == 'ARMATURE':
+            collection = obj.data.edit_bones if context.mode == 'EDIT_ARMATURE' else obj.pose.bones
+            for bone in collection:
+                if (bone.select if context.mode == 'EDIT_ARMATURE' else bone.bone.select):
+                    path = ([{'property': 'data'}, {'property': 'edit_bones'}] if context.mode == 'EDIT_ARMATURE'
+                            else [{'property': 'pose'}, {'property': 'bones'}]) + [{'key': bone.name}]
+                    ref, _ = self.reference('objects', obj.name, path)
+                    state['selection'].append({'kind': 'bone', 'reference_id': ref, 'name': bone.name})
+                    if len(state['selection']) >= 256:
+                        break
+        state['editor_context'] = None
+        if editor_key is not None:
+            window, area = self.editor(editor_key)
+            space = area.spaces.active
+            details = {'editor_key': editor_key, 'type': area.type, 'selected_nodes': [], 'view': None,
+                       'active_material': None, 'properties_context': None}
+            if area.type == 'VIEW_3D':
+                region = space.region_3d
+                details['view'] = {'view_matrix': [list(row) for row in region.view_matrix],
+                                   'perspective_matrix': [list(row) for row in region.perspective_matrix],
+                                   'shading': space.shading.type, 'perspective': region.view_perspective}
+            elif area.type == 'PROPERTIES':
+                details['properties_context'] = space.context
+                pinned = getattr(space, 'pin_id', None)
+                details['pinned_datablock'] = None if pinned is None else {
+                    'name': pinned.name, 'identity': pinned.as_pointer(), 'rna_type': pinned.bl_rna.identifier}
+            elif area.type == 'NODE_EDITOR':
+                tree = space.edit_tree
+                details['node_tree'] = None if tree is None else {'name': tree.name, 'identity': tree.as_pointer()}
+                details['selected_nodes'] = [] if tree is None else [node.name for node in tree.nodes if node.select][:128]
+                details['active_node'] = None if tree is None or tree.nodes.active is None else tree.nodes.active.name
+            if obj is not None and getattr(obj, 'active_material', None) is not None:
+                ref, _ = self.reference('materials', obj.active_material.name)
+                details['active_material'] = ref
+            state['editor_context'] = details
+        state['mesh_selection'] = None
+        if obj is not None and context.mode == 'EDIT_MESH':
+            import bmesh
+            mesh = bmesh.from_edit_mesh(obj.data)
+            for collection in (mesh.verts, mesh.edges, mesh.faces):
+                collection.index_update()
+            state['mesh_selection'] = {
+                'object': obj.name, 'indices_are_observation_only': True,
+                'vertices': [v.index for v in mesh.verts if v.select][:256],
+                'edges': [e.index for e in mesh.edges if e.select][:256],
+                'faces': [f.index for f in mesh.faces if f.select][:256],
+                'truncated': any(sum(1 for item in coll if item.select) > 256 for coll in (mesh.verts, mesh.edges, mesh.faces)),
             }
+        state['focused_property'] = None
+        button_pointer = getattr(context, 'button_pointer', None)
+        button_property = getattr(context, 'button_prop', None)
+        if button_pointer is not None and button_property is not None:
+            state['focused_property'] = {'identity': button_pointer.as_pointer(),
+                                         'rna_type': button_pointer.bl_rna.identifier,
+                                         'property': button_property.identifier,
+                                         'source': 'actual_button_context'}
+        # Includes editor-specific node selection when explicitly observing that editor.
+        state['context_digest'] = self.digest({k: state[k] for k in ('epoch', 'scene_identity', 'view_layer_identity',
+                                          'mode', 'selection_serial', 'selection', 'editor_context', 'mesh_selection')})
         return state
 
-    def observe(self, context, capture_id=None):
-        current = self.sample(context)
+    def capture(self, context, source='agent_request', editor_key=None):
+        if editor_key is None and getattr(context, 'area', None) is not None and getattr(context, 'window', None) is not None:
+            editor_key = f'{context.window.as_pointer()}:{context.area.as_pointer()}'
+        state = self.workspace(context, editor_key)
+        # Button focus is captured evidence, not reproducible from a timer's
+        # global context. It is not used to infer current keyboard focus.
+        if len(self.captures) >= self.CAPTURE_LIMIT:
+            self.error('CAPTURE_CAPACITY')
+        key = uuid.uuid4().hex
+        state.update(capture_id=key, source=source, captured_at=time.time(), editor_key=editor_key)
+        self.captures[key] = self.copy(state)
+        return self.copy(state)
+
+    def observe_context(self, context, capture_id=None, editor_key=None):
+        current = self.workspace(context, editor_key)
         if capture_id is None:
-            return {'current': current, 'latest_capture_id': next(reversed(self.captures), None)}
+            return {'current': current}
         captured = self.captures.get(capture_id)
         if captured is None:
-            self._error('CAPTURE_NOT_FOUND')
-        return {'capture': self._copy(captured), 'current': current,
-                'stale': captured['epoch'] != current['epoch'] or
-                         captured['selection_serial'] != current['selection_serial'] or
-                         captured.get('bone_digest') != current.get('bone_digest')}
-
-    def capture(self, context, source='agent_request'):
-        state = self.sample(context)
-        if state['target'] is None:
-            self._error('SELECT_ONE_ACTIVE_ARMATURE_BONE')
-        if len(self.captures) >= self.LIMIT:
-            self._error('CAPTURE_CAPACITY_RELEASE_OR_RESTART')
-        capture_id = uuid.uuid4().hex
-        state.update(capture_id=capture_id, source=source, captured_at=time.time())
-        area = getattr(context, 'area', None)
-        state['editor'] = None if area is None else {'type': area.type, 'identity': area.as_pointer()}
-        window = getattr(context, 'window', None)
-        state['window_identity'] = None if window is None else window.as_pointer()
-        region_data = getattr(context, 'region_data', None)
-        # A sidebar invocation may not carry WINDOW region data. Never substitute
-        # another viewport and call it the user's current view.
-        state['view'] = None if region_data is None else {
-            'view_matrix': [list(row) for row in region_data.view_matrix],
-            'perspective_matrix': [list(row) for row in region_data.perspective_matrix],
-        }
-        self.captures[capture_id] = self._copy(state)
-        return self._copy(state)
+            self.error('CAPTURE_EXPIRED')
+        current = self.workspace(context, captured['editor_key'])
+        return {'capture': self.copy(captured), 'current': current,
+                'stale': current['context_digest'] != captured['context_digest']}
 
     def release(self, capture_id):
         if capture_id not in self.captures:
-            self._error('CAPTURE_NOT_FOUND')
+            self.error('CAPTURE_EXPIRED')
         del self.captures[capture_id]
         return {'released': capture_id}
 
-    def resolve(self, target, mode):
-        obj = bpy.data.objects.get(target['object'])
-        if (obj is None or obj.type != 'ARMATURE' or obj.as_pointer() != target['object_identity'] or
-                obj.data.as_pointer() != target['armature_identity']):
-            self._error('TARGET_IDENTITY_CHANGED')
-        identity_collection = obj.data.edit_bones if mode == 'EDIT_ARMATURE' else obj.data.bones
-        identity = identity_collection.get(target['bone'])
-        if identity is None or identity.as_pointer() != target['bone_identity']:
-            self._error('TARGET_IDENTITY_CHANGED')
-        bone = obj.pose.bones.get(target['bone']) if mode == 'POSE' else identity
-        return obj, bone
-
-    @staticmethod
-    def read_bone(bone, mode):
-        if mode == 'POSE':
-            return {'location': list(bone.location)}
-        return {'head': list(bone.head), 'tail': list(bone.tail), 'roll': float(bone.roll)}
-
-    def validate_transform(self, transform, mode):
-        allowed = {'location'} if mode == 'POSE' else {'head', 'tail', 'roll'}
-        if not isinstance(transform, dict) or not transform or set(transform) - allowed:
-            self._error('UNSUPPORTED_TRANSFORM_FIELDS')
-        out = {}
-        for name, value in transform.items():
-            if name == 'roll':
-                values = [value]
-            else:
-                if not isinstance(value, list) or len(value) != 3:
-                    self._error('INVALID_VECTOR')
-                values = value
-            if any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or abs(v) > 1e6 for v in values):
-                self._error('INVALID_TRANSFORM_VALUE')
-            out[name] = float(value) if name == 'roll' else [float(v) for v in value]
-        return out
-
-    def _request(self, request_id, body):
-        if not isinstance(request_id, str) or not 1 <= len(request_id) <= 128:
-            self._error('REQUEST_ID_REQUIRED')
-        digest = self._digest(body)
-        previous = self.requests.get(request_id)
-        if previous is not None:
-            if previous['hash'] != digest:
-                self._error('REQUEST_ID_REUSED')
-            if previous.get('result') is None:
-                self._error('ORIGINAL_OUTCOME_UNKNOWN')
-            return digest, self._copy(previous['result'])
-        if len(self.requests) >= 64:
-            self._error('REQUEST_CAPACITY_RESTART_SESSION')
-        return digest, None
-
-    def apply(self, context, capture_id, expected_digest, transform, request_id):
-        digest, duplicate = self._request(request_id, {'capture_id': capture_id, 'expected_digest': expected_digest,
-                                                       'transform': transform})
-        if duplicate is not None:
-            return duplicate
-        current = self.sample(context)
+    def guard(self, context, capture_id):
         captured = self.captures.get(capture_id)
         if captured is None:
-            self._error('CAPTURE_NOT_FOUND')
-        if not current['scoped_bone_edits_enabled']:
-            self._error('SCOPED_BONE_EDITS_DISABLED')
-        if captured['epoch'] != current['epoch']:
-            self._error('DOCUMENT_CHANGED')
-        if captured['mode'] != current['mode']:
-            self._error('MODE_CHANGED')
-        if captured['selection_serial'] != current['selection_serial'] or captured['target'] != current['target']:
-            self._error('SELECTION_CHANGED')
-        if expected_digest != captured.get('bone_digest') or expected_digest != current.get('bone_digest'):
-            self._error('BONE_STATE_CHANGED')
-        mode = captured['mode']
-        changes = self.validate_transform(transform, mode)
-        obj, bone = self.resolve(captured['target'], mode)
-        if getattr(obj, 'library', None) or getattr(obj.data, 'library', None) or obj.data.users > 1:
-            self._error('LINKED_OR_SHARED_ARMATURE_UNSUPPORTED')
-        if getattr(obj, 'animation_data', None) or getattr(obj.data, 'animation_data', None):
-            self._error('ANIMATED_ARMATURE_UNSUPPORTED')
-        before = self.read_bone(bone, mode)
-        desired = dict(before, **changes)
-        if mode == 'EDIT_ARMATURE':
-            if bone.use_connect or any(child.use_connect for child in bone.children):
-                self._error('CONNECTED_EDIT_BONE_UNSUPPORTED')
-            if sum((a - b) ** 2 for a, b in zip(desired['head'], desired['tail'])) < 1e-12:
-                self._error('ZERO_LENGTH_BONE')
-        elif bone.constraints or any(bone.lock_location):
-            self._error('CONSTRAINED_OR_LOCKED_BONE_UNSUPPORTED')
-        self.requests[request_id] = {'hash': digest, 'result': None}
-        try:
-            for name, value in changes.items():
-                setattr(bone, name, value)
-            context.view_layer.update()
-            after = self.read_bone(bone, mode)
-            verified = all(abs(a - b) <= 1e-5 for name in desired for a, b in
-                           zip([after[name]] if name == 'roll' else after[name],
-                               [desired[name]] if name == 'roll' else desired[name]))
-            if not verified:
-                self._error('READBACK_MISMATCH')
-        except Exception:
-            for name, value in before.items():
-                setattr(bone, name, value)
-            context.view_layer.update()
-            raise
-        receipt_id = uuid.uuid4().hex
-        result = {'receipt_id': receipt_id, 'capture_id': capture_id, 'request_id': request_id,
-                  'target': captured['target'], 'before': before, 'after': after,
-                  'before_digest': self._digest(before), 'after_digest': self._digest(after),
-                  'verified': True, 'scope': 'native_property_readback', 'epoch': self.epoch,
-                  'mode': mode, 'selection_serial': self.serial}
-        self.receipts[receipt_id] = self._copy(result)
-        self.requests[request_id]['result'] = self._copy(result)
-        return self._copy(result)
+            self.error('CAPTURE_EXPIRED')
+        current = self.workspace(context, captured['editor_key'])
+        if current['epoch'] != captured['epoch'] or current['context_digest'] != captured['context_digest']:
+            self.error('CONTEXT_CHANGED')
+        return captured
 
-    def undo(self, context, receipt_id, request_id):
-        digest, duplicate = self._request(request_id, {'undo_receipt_id': receipt_id})
+    def operator_supported(self, idname):
+        parts = idname.split('.')
+        return len(parts) == 2 and parts[0] in self.OPERATOR_NAMESPACES and not any(
+            word in parts[1].split('_') for word in self.BLOCKED_OPERATOR_WORDS)
+
+    def discover(self, query='', limit=30):
+        if not isinstance(query, str) or len(query) > 256 or not isinstance(limit, int) or not 1 <= limit <= 100:
+            self.error('INVALID_DISCOVERY_QUERY')
+        operations = []
+        total = 0
+        for namespace in dir(bpy.ops):
+            if namespace.startswith('_'):
+                continue
+            for name in dir(getattr(bpy.ops, namespace)):
+                idname = namespace + '.' + name
+                if name.startswith('_') or query.lower() not in idname.lower():
+                    continue
+                try:
+                    rna = getattr(getattr(bpy.ops, namespace), name).get_rna_type()
+                except Exception:
+                    continue
+                total += 1
+                if len(operations) < limit:
+                    operations.append({'idname': idname, 'label': rna.name, 'description': rna.description,
+                                       'execution_supported': self.operator_supported(idname),
+                                       'parameters': [self.schema(p) for p in rna.properties if p.identifier != 'rna_type'],
+                                       'poll_requires_captured_editor': True, 'compensation': 'unavailable'})
+        return {'protocol': 'blender-companion/1', 'operations': operations, 'total': total,
+                'truncated': total > len(operations), 'data_collections': self.collections(),
+                'property_types': ['BOOLEAN', 'INT', 'FLOAT', 'STRING', 'ENUM'],
+                'permission_required': True, 'operator_execution': 'EXEC_DEFAULT with native poll',
+                'unsupported': ['pointer_collection_assignment', 'modal_operator_execution', 'all_ui_parity']}
+
+    def validate_value(self, prop, value):
+        if not self.schema(prop)['property_edit_supported']:
+            self.error('PROPERTY_WRITE_UNSUPPORTED')
+        values = [value]
+        if getattr(prop, 'is_array', False):
+            dimensions = [d for d in getattr(prop, 'array_dimensions', ()) if d] or [prop.array_length]
+            def flatten(item, shape):
+                if not shape:
+                    return [item]
+                if not isinstance(item, list) or len(item) != shape[0]:
+                    self.error('INVALID_PROPERTY_ARRAY')
+                return [scalar for child in item for scalar in flatten(child, shape[1:])]
+            values = flatten(value, dimensions)
+            if len(values) != prop.array_length or len(values) > 64:
+                self.error('INVALID_PROPERTY_ARRAY')
+        if prop.type == 'ENUM' and getattr(prop, 'is_enum_flag', False):
+            if not isinstance(value, list) or not all(isinstance(v, str) and v in self.schema(prop)['enum_items'] for v in value):
+                self.error('INVALID_ENUM_VALUE')
+            return set(value)
+        for item in values:
+            if prop.type == 'BOOLEAN' and not isinstance(item, bool):
+                self.error('INVALID_BOOLEAN_VALUE')
+            if prop.type in {'FLOAT', 'INT'}:
+                if isinstance(item, bool) or not isinstance(item, (float, int)) or not math.isfinite(item):
+                    self.error('INVALID_NUMERIC_VALUE')
+                if prop.type == 'INT' and not isinstance(item, int):
+                    self.error('INVALID_INTEGER_VALUE')
+                if item < prop.hard_min or item > prop.hard_max:
+                    self.error('PROPERTY_RANGE')
+            if prop.type == 'STRING' and (not isinstance(item, str) or len(item.encode('utf-8')) > 4096):
+                self.error('INVALID_STRING_VALUE')
+            if prop.type == 'ENUM' and item not in self.schema(prop)['enum_items']:
+                self.error('INVALID_ENUM_VALUE')
+        return value
+
+    def admission(self, request_id, body):
+        if not isinstance(request_id, str) or not 1 <= len(request_id) <= 128:
+            self.error('REQUEST_ID_REQUIRED')
+        digest = self.digest(body)
+        previous = self.requests.get(request_id)
+        if previous is not None:
+            if previous['request_hash'] != digest:
+                self.error('REQUEST_ID_REUSED')
+            return digest, self.copy(previous)
+        if len(self.requests) >= self.REQUEST_LIMIT:
+            self.error('REQUEST_CAPACITY')
+        return digest, None
+
+    def execute(self, context, capture_id, request_id, kind, reference_id=None, property=None,
+                value=None, expected_digest=None, operator=None, arguments=None, target_policy='explicit'):
+        args = dict(capture_id=capture_id, request_id=request_id, kind=kind, reference_id=reference_id,
+                    property=property, value=value, expected_digest=expected_digest,
+                    operator=operator, arguments=arguments, target_policy=target_policy)
+        captured = self.captures.get(capture_id)
+        if request_id in self.requests or captured is None or captured['editor_key'] is None:
+            return self._execute_native(context, **args)
+        window, area = self.editor(captured['editor_key'])
+        region = next((r for r in area.regions if r.type == 'WINDOW'), None)
+        override = {'window': window, 'area': area}
+        if region is not None:
+            override['region'] = region
+        with context.temp_override(**override):
+            return self._execute_native(context, **args)
+
+    def _execute_native(self, context, capture_id, request_id, kind, reference_id=None, property=None,
+                        value=None, expected_digest=None, operator=None, arguments=None, target_policy='explicit'):
+        body = {'capture_id': capture_id, 'kind': kind, 'reference_id': reference_id, 'property': property,
+                'value': value, 'expected_digest': expected_digest, 'operator': operator, 'arguments': arguments,
+                'target_policy': target_policy}
+        digest, duplicate = self.admission(request_id, body)
         if duplicate is not None:
             return duplicate
-        receipt = self.receipts.get(receipt_id)
-        if receipt is None:
-            self._error('RECEIPT_NOT_FOUND')
-        current = self.sample(context)
-        if (receipt['epoch'] != current['epoch'] or receipt['mode'] != current['mode'] or
-                receipt['selection_serial'] != current['selection_serial'] or receipt['target'] != current['target']):
-            self._error('UNDO_CONTEXT_CHANGED')
-        if receipt['after_digest'] != current.get('bone_digest'):
-            self._error('UNDO_STATE_CHANGED')
-        # Compensation is a new guarded write, never a global Blender undo.
-        captured = self.capture(context, source='compensation')
-        try:
-            result = self.apply(context, captured['capture_id'], captured['bone_digest'], receipt['before'], request_id)
-        finally:
-            self.release(captured['capture_id'])
-            # Preserve the original undo request identity even if compensation
-            # failed after admission. It must never be redispatched on a retry.
-            if request_id in self.requests:
-                self.requests[request_id]['hash'] = digest
-        self.requests[request_id]['hash'] = digest
-        result['compensates'] = receipt_id
-        self.requests[request_id]['result'] = self._copy(result)
+        captured = self.guard(context, capture_id)
+        if target_policy not in {'explicit', 'captured_selection'}:
+            self.error('TARGET_POLICY_UNSUPPORTED')
+        if target_policy == 'captured_selection' and kind == 'set_property' and not any(
+                item['reference_id'] == reference_id for item in captured['selection']):
+            self.error('CAPTURED_TARGET_MISMATCH')
+        permission = self.permissions(context)
+        result = {'request_id': request_id, 'request_hash': digest, 'kind': kind, 'capture_id': capture_id,
+                  'epoch': self.epoch, 'status': 'outcome_unknown', 'compensation': 'unavailable'}
+        if kind == 'set_property':
+            if not permission['property_edit']:
+                self.error('PROPERTY_EDITS_DISABLED')
+            root, target = self.resolve(reference_id)
+            if getattr(root, 'library', None) is not None:
+                self.error('LINKED_DATABLOCK_WRITE_UNSUPPORTED')
+            prop = target.bl_rna.properties.get(property) if isinstance(property, str) else None
+            if prop is None:
+                self.error('RNA_PROPERTY_NOT_FOUND')
+            desired = self.validate_value(prop, value)
+            before = self.serialize(getattr(target, property), prop)
+            if expected_digest != self.digest(before):
+                self.error('PROPERTY_STATE_CHANGED')
+            self.requests[request_id] = result
+            try:
+                setattr(target, property, desired)
+                context.view_layer.update()
+                after = self.serialize(getattr(target, property), prop)
+                expected = sorted(desired) if isinstance(desired, set) else desired
+                actual_values = after if isinstance(after, list) else [after]
+                expected_values = expected if isinstance(expected, list) else [expected]
+                def matches(a, b):
+                    if isinstance(a, list) and isinstance(b, list):
+                        return len(a) == len(b) and all(matches(x, y) for x, y in zip(a, b))
+                    if isinstance(a, (int, float)) and not isinstance(a, bool):
+                        return math.isclose(a, b, rel_tol=1e-6, abs_tol=1e-6)
+                    return a == b
+                verified = matches(actual_values, expected_values)
+                if not verified:
+                    self.error('NATIVE_READBACK_MISMATCH')
+                result.update(status='applied', reference_id=reference_id, property=property, before=before,
+                              after=after, after_digest=self.digest(after), verified=True,
+                              compensation='guarded_property_restore')
+            except Exception as exc:
+                result.update(error=str(exc), status='failed', verified=False)
+                try:
+                    setattr(target, property, self.validate_value(prop, before))
+                    context.view_layer.update()
+                    result['restored'] = self.serialize(getattr(target, property), prop) == before
+                except Exception:
+                    result['restored'] = False
+                if not result['restored']:
+                    result['status'] = 'outcome_unknown'
+        elif kind == 'invoke_operator':
+            if not permission['native_operator']:
+                self.error('NATIVE_OPERATORS_DISABLED')
+            if not isinstance(operator, str) or not self.operator_supported(operator):
+                self.error('OPERATOR_EXECUTION_UNSUPPORTED')
+            if captured['editor_key'] is None:
+                self.error('CAPTURED_EDITOR_REQUIRED')
+            if not isinstance(arguments, dict) or len(arguments) > 32 or len(json.dumps(arguments)) > 16384:
+                self.error('INVALID_OPERATOR_ARGUMENTS')
+            namespace, name = operator.split('.')
+            op = getattr(getattr(bpy.ops, namespace), name)
+            rna = op.get_rna_type()
+            converted = {}
+            for key, item in arguments.items():
+                prop = rna.properties.get(key)
+                if prop is None or key == 'rna_type':
+                    self.error('OPERATOR_PARAMETER_NOT_FOUND')
+                # Operator parameters may be writable even though type metadata
+                # differs from a datablock property; unsupported pointer args refuse.
+                converted[key] = self.validate_value(prop, item)
+            window, area = self.editor(captured['editor_key'])
+            region = next((region for region in area.regions if region.type == 'WINDOW'), None)
+            if region is None:
+                self.error('EDITOR_WINDOW_REGION_UNAVAILABLE')
+            with context.temp_override(window=window, area=area, region=region):
+                if not op.poll():
+                    self.error('NATIVE_OPERATOR_POLL_FAILED')
+                self.requests[request_id] = result
+                try:
+                    native = sorted(op('EXEC_DEFAULT', **converted))
+                    result.update(native_result=native, status='applied' if native == ['FINISHED'] else 'outcome_unknown',
+                                  operator=operator, verified=False)
+                except Exception as exc:
+                    result.update(error=str(exc), status='outcome_unknown')
+            # Observe, but never invent a generic operator verification/rollback.
+            try:
+                result['readback'] = self.workspace(context, captured['editor_key'])
+            except Exception:
+                result['readback'] = {'unavailable': 'context_changed_after_operator'}
+        else:
+            self.error('OPERATION_KIND_UNSUPPORTED')
+        self.requests[request_id] = self.copy(result)
+        return self.copy(result)
+
+    def observe_operation(self, request_id):
+        if request_id not in self.requests:
+            self.error('REQUEST_NOT_RETAINED')
+        return self.copy(self.requests[request_id])
+
+    def compensate(self, context, original_request_id, capture_id, request_id):
+        original = self.observe_operation(original_request_id)
+        if original.get('compensation') != 'guarded_property_restore' or original['status'] != 'applied':
+            self.error('COMPENSATION_UNSUPPORTED')
+        result = self.execute(context, capture_id, request_id, 'set_property', original['reference_id'],
+                              original['property'], original['before'], original['after_digest'])
+        result['compensates'] = original_request_id
+        self.requests[request_id] = self.copy(result)
         return result
 
 
@@ -310,7 +592,7 @@ bl_info = {
 }
 
 # Keep in sync with blender_mcp.addon_manager.EXPECTED_ADDON_PROTOCOL_VERSION.
-ADDON_PROTOCOL_VERSION = 14
+ADDON_PROTOCOL_VERSION = 15
 
 # Per-snapshot object cap for get_world_state_snapshot. Keep in sync with
 # blender_mcp.trajectory.MAX_SNAPSHOT_OBJECTS.
@@ -1784,11 +2066,15 @@ class BlenderMCPServer:
             "list_scene_items": self.list_scene_items,
             "get_viewport_screenshot": self.get_viewport_screenshot,
             "pick_viewport_object": self.pick_viewport_object,
-            "get_editor_context": lambda capture_id=None: _live_editor_context.observe(bpy.context, capture_id),
-            "capture_editor_context": lambda: _live_editor_context.capture(bpy.context),
-            "release_editor_context": _live_editor_context.release,
-            "apply_bone_transform": lambda **args: _live_editor_context.apply(bpy.context, **args),
-            "undo_bone_transform": lambda **args: _live_editor_context.undo(bpy.context, **args),
+            "workspace_inspect": self.workspace_inspect,
+            "context_capture": self.context_capture,
+            "context_resolve": self.context_resolve,
+            "context_release": _live_editor_context.release,
+            "entity_inspect": self.entity_inspect,
+            "capability_discover": _live_editor_context.discover,
+            "operation_execute": self.operation_execute,
+            "operation_observe": _live_editor_context.observe_operation,
+            "operation_compensate": self.operation_compensate,
             "execute_code": self.execute_code,
             "describe_node_type": self.describe_node_type,
             "bpy_api_lookup": self.bpy_api_lookup,
@@ -1869,6 +2155,24 @@ class BlenderMCPServer:
 
 
 
+    def workspace_inspect(self, editor_key=None):
+        return _live_editor_context.workspace(bpy.context, editor_key)
+
+    def context_capture(self, editor_key=None):
+        return _live_editor_context.capture(bpy.context, editor_key=editor_key)
+
+    def context_resolve(self, capture_id):
+        return _live_editor_context.observe_context(bpy.context, capture_id)
+
+    def entity_inspect(self, **args):
+        return _live_editor_context.inspect(bpy.context, **args)
+
+    def operation_execute(self, **args):
+        return _live_editor_context.execute(bpy.context, **args)
+
+    def operation_compensate(self, **args):
+        return _live_editor_context.compensate(bpy.context, **args)
+
     def get_addon_info(self):
         """Version/capability handshake for the MCP server (and install tooling)."""
         return {
@@ -1886,11 +2190,8 @@ class BlenderMCPServer:
                 "execute_code",
                 "describe_node_type",
                 "bpy_api_lookup",
-                "get_editor_context", "capture_editor_context", "release_editor_context",
-                "apply_bone_transform", "undo_bone_transform",
-                "drain_human_activity",
-                "get_telemetry_consent",
-                "set_telemetry_consent",
+                "workspace_inspect", "context_capture", "context_resolve", "context_release",
+                "entity_inspect", "capability_discover", "operation_execute", "operation_observe", "operation_compensate",
             ]),
             "blender_version": bpy.app.version_string,
             "premium_generators": premium_enabled_generators(),
@@ -6132,8 +6433,8 @@ class BLENDERMCP_AddonPreferences(bpy.types.AddonPreferences):
 # Blender UI Panel
 class BLENDERMCP_OT_CaptureContext(bpy.types.Operator):
     bl_idname = "blendermcp.capture_context"
-    bl_label = "Capture selected bone for AI"
-    bl_description = "Pin the current bone selection; tell the AI to use this capture ID"
+    bl_label = "Capture editor context for AI"
+    bl_description = "Pin the actual editor and selection; tell the AI to use this capture ID"
 
     def execute(self, context):
         try:
@@ -6141,7 +6442,7 @@ class BLENDERMCP_OT_CaptureContext(bpy.types.Operator):
         except Exception as exc:
             self.report({'WARNING'}, str(exc))
             return {'CANCELLED'}
-        self.report({'INFO'}, "Captured bone: " + captured['target']['bone'])
+        self.report({'INFO'}, "Captured editor context: " + captured['capture_id'])
         return {'FINISHED'}
 
 
@@ -6181,12 +6482,13 @@ class BLENDERMCP_PT_Panel(bpy.types.Panel):
 
         box = layout.box()
         box.label(text="Shared editor context")
-        box.operator("blendermcp.capture_context", text="Capture selected bone for AI")
+        box.operator("blendermcp.capture_context", text="Capture editor context for AI")
         capture_id = next(reversed(_live_editor_context.captures), None)
         if capture_id:
             box.label(text="Capture: " + capture_id)
-        box.prop(scene, "blendermcp_allow_bone_edits")
-        box.label(text="Scoped edits only; raw Python is separate.")
+        box.prop(scene, "blendermcp_allow_property_edits")
+        box.prop(scene, "blendermcp_allow_native_operators")
+        box.label(text="Native companion; raw Python is separate.")
 
         # Asset libraries
         layout.separator()
@@ -6522,9 +6824,12 @@ class BLENDERMCP_OT_OpenTerms(bpy.types.Operator):
 
 # Registration functions
 def register():
-    bpy.types.Scene.blendermcp_allow_bone_edits = bpy.props.BoolProperty(
-        name="Allow captured bone edits", default=False, options={'SKIP_SAVE'},
-        description="Permit guarded pose location/edit bone head-tail-roll changes for this session")
+    bpy.types.Scene.blendermcp_allow_property_edits = bpy.props.BoolProperty(
+        name="Allow native property edits", default=False, options={'SKIP_SAVE'},
+        description="Allow guarded native RNA property edits through the companion for this session")
+    bpy.types.Scene.blendermcp_allow_native_operators = bpy.props.BoolProperty(
+        name="Allow native companion operators", default=False, options={'SKIP_SAVE'},
+        description="Allow supported native operators in captured editor context for this session")
     bpy.utils.register_class(BLENDERMCP_OT_CaptureContext)
     bpy.types.Scene.blendermcp_port = IntProperty(
         name="Port",
@@ -6704,7 +7009,8 @@ def register():
 def unregister():
     _live_editor_context.invalidate()
     bpy.utils.unregister_class(BLENDERMCP_OT_CaptureContext)
-    del bpy.types.Scene.blendermcp_allow_bone_edits
+    del bpy.types.Scene.blendermcp_allow_property_edits
+    del bpy.types.Scene.blendermcp_allow_native_operators
     _blendermcp_unregister_auto_start()
 
     _unregister_edit_capture_handlers()

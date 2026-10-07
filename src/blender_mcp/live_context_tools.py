@@ -1,82 +1,119 @@
-"""MCP bindings for native editor context; authority stays in the add-on."""
+"""Generic companion MCP bindings; native resolution and authority stay in Blender."""
 import json
+from typing import Any, Literal
 
 
 def register(mcp, connection):
     def send(command, params=None):
         try:
-            return json.dumps({'ok': True, 'result': connection().send_command(command, params, read_only=command not in {
-                'apply_bone_transform', 'undo_bone_transform'})}, allow_nan=False)
+            return json.dumps({'ok': True, 'result': connection().send_command(command, params,
+                read_only=command not in {'operation_execute', 'operation_compensate'})}, allow_nan=False)
         except Exception as exc:
             return json.dumps({'ok': False, 'error': str(exc)})
 
     @mcp.tool()
-    def get_editor_context(capture_id: str | None = None) -> str:
-        """Read actual active object, selected bones, mode and supported live context.
+    def inspect_blender_workspace(editor_key: str | None = None) -> str:
+        """Inspect live modes, selections, native data collections and window/editor keys.
 
-        With a capture ID, read the immutable original and fresh state/staleness.
-        Without it, discover latest explicit human capture. Does not know chat
-        timing: bind 'this bone' to an explicit capture, never silently retarget.
-        Unsupported UI/subelement fields are explicitly listed. Requires add-on 14.
+        Supply an editor_key for actual viewport matrices, Properties tab or Node
+        Editor selection. Returns permission state and explicit unavailable context.
+        Does not infer chat timing or identify every visible widget.
         """
-        return send('get_editor_context', {'capture_id': capture_id})
+        return send('workspace_inspect', {'editor_key': editor_key})
 
     @mcp.tool()
-    def capture_editor_context() -> str:
-        """Pin the current single active bone, mode, identity and native properties.
+    def capture_blender_context(editor_key: str | None = None) -> str:
+        """Pin immutable workspace/editor context and selection for a workflow.
 
-        This is an agent-requested capture, not evidence of a human gesture.
-        Prefer the user's Capture selected bone for AI button for 'this bone'.
-        Preserve capture_id and bone_digest for guarded actions. Capacity is finite.
+        Agent captures are labelled. For 'this', prefer the user's Capture editor
+        context for AI button and preserve that exact capture ID. Native operator
+        invocation requires an explicit captured editor_key.
         """
-        return send('capture_editor_context')
+        return send('context_capture', {'editor_key': editor_key})
 
     @mcp.tool()
-    def release_editor_context(capture_id: str) -> str:
-        """Release an immutable context capture when its workflow is settled."""
-        return send('release_editor_context', {'capture_id': capture_id})
+    def resolve_blender_context(capture_id: str) -> str:
+        """Read original captured context and fresh state/staleness; never retarget."""
+        return send('context_resolve', {'capture_id': capture_id})
 
     @mcp.tool()
-    def discover_blender_controls(query: str, node_type: bool = False) -> str:
-        """Discover native RNA types/properties/operator parameters on this Blender.
-
-        Examples: PoseBone.location, EditBone, bpy.ops.pose.transforms_clear.
-        node_type=True describes sockets via the existing scratch-node routine.
-        Discovery is not permission or proof that an operator polls successfully;
-        only the captured bone action contract below is executable through this
-        scoped path. Other operations still require the legacy Python facility.
-        """
-        return send('describe_node_type' if node_type else 'bpy_api_lookup',
-                    {'bl_idname': query} if node_type else {'query': query})
+    def release_blender_context(capture_id: str) -> str:
+        """Release a settled capture from bounded session retention."""
+        return send('context_release', {'capture_id': capture_id})
 
     @mcp.tool()
-    def apply_bone_transform(capture_id: str, expected_digest: str, request_id: str,
-                             location: list[float] | None = None,
-                             head: list[float] | None = None,
-                             tail: list[float] | None = None,
-                             roll: float | None = None) -> str:
-        """Guarded native edit of the exact captured selected bone, with readback.
+    def inspect_blender_entity(collection: str | None = None, name: str | None = None,
+                               path: list[dict[str, Any]] | None = None,
+                               reference_id: str | None = None,
+                               properties: list[str] | None = None) -> str:
+        """Inspect native bpy.data entities or nested RNA structures, without Python eval.
 
-        User must enable Allow captured bone edits in Blender for this session.
-        POSE accepts location only (bone local channels, scene length units).
-        EDIT_ARMATURE accepts head/tail (armature-local coordinates) and roll
-        (radians). Connected/shared/linked/animated or constrained cases may be
-        refused. No mode switch, keyframes, rotation or arbitrary Python.
-        Selection/mode/document/property changes invalidate the write. Reuse the
-        exact request ID on uncertain transport outcomes; never retry with a new
-        ID. A result verifies native properties, not visual rig correctness.
+        Use collection/name from discovery or a returned reference_id. path is a
+        bounded traversal: {property:'data'}, {property:'nodes'}, {key:'Principled
+        BSDF'}, {index:0}. Returns schemas and requested values/digests (up to 32).
+        Objects, cameras, materials, scenes, nodes and bones share this route.
+        Pointer/collection observations describe relationships; writes require
+        native writable scalar/array properties.
         """
-        transform = {key: value for key, value in {'location': location, 'head': head,
-                     'tail': tail, 'roll': roll}.items() if value is not None}
-        return send('apply_bone_transform', {'capture_id': capture_id,
-                    'expected_digest': expected_digest, 'request_id': request_id,
-                    'transform': transform})
+        return send('entity_inspect', {'collection': collection, 'name': name, 'path': path,
+                    'reference_id': reference_id, 'properties': properties})
 
     @mcp.tool()
-    def undo_bone_transform(receipt_id: str, request_id: str) -> str:
-        """Compensate a verified edit only if its target/context/after-state still match.
+    def discover_blender_capabilities(query: str = '', limit: int = 30,
+                                      rna_query: str | None = None,
+                                      node_type: str | None = None) -> str:
+        """Discover runtime operators/data or exact native RNA/node schemas.
 
-        This is a new guarded edit with native readback, not global Blender Undo.
-        Other human edits are never blindly reverted. Retain its returned receipt.
+        query filters operator catalog with explicit execution support. rna_query:
+        Object.location, Camera.lens or bpy.ops.mesh.primitive_cube_add. node_type
+        describes real sockets using a scratch node. Discovery is not authority,
+        successful poll or a universal transaction/undo guarantee.
         """
-        return send('undo_bone_transform', {'receipt_id': receipt_id, 'request_id': request_id})
+        if rna_query is not None and node_type is not None:
+            return json.dumps({'ok': False, 'error': 'CHOOSE_ONE_SCHEMA_QUERY'})
+        if rna_query is not None:
+            return send('bpy_api_lookup', {'query': rna_query})
+        if node_type is not None:
+            return send('describe_node_type', {'bl_idname': node_type})
+        return send('capability_discover', {'query': query, 'limit': limit})
+
+    @mcp.tool()
+    def execute_blender_operation(capture_id: str, request_id: str,
+                                   kind: Literal['set_property', 'invoke_operator'],
+                                   reference_id: str | None = None,
+                                   property: str | None = None, value: Any = None,
+                                   expected_digest: str | None = None,
+                                   operator: str | None = None,
+                                   arguments: dict[str, Any] | None = None,
+                                   target_policy: Literal['explicit', 'captured_selection'] = 'explicit') -> str:
+        """Execute generic native property edits or supported native operators.
+
+        set_property requires a reference/property/value and inspected digest.
+        invoke_operator requires native idname/arguments and captured editor.
+        Enable the respective session permission in Blender. Schema, context,
+        identity, value and poll checks execute in the add-on. No raw Python
+        fallback. Retain request_id on transport uncertainty; observe the original
+        before issuing new work. FINISHED alone does not verify an operator's
+        domain result. Unsupported operations and compensation remain explicit.
+        For 'this selected entity', use target_policy='captured_selection'; other
+        explicit references remain valid named targets in the captured document.
+        """
+        return send('operation_execute', {'capture_id': capture_id, 'request_id': request_id,
+                    'kind': kind, 'reference_id': reference_id, 'property': property,
+                    'value': value, 'expected_digest': expected_digest,
+                    'operator': operator, 'arguments': arguments, 'target_policy': target_policy})
+
+    @mcp.tool()
+    def observe_blender_operation(request_id: str) -> str:
+        """Read an original retained outcome without re-executing or inventing success."""
+        return send('operation_observe', {'request_id': request_id})
+
+    @mcp.tool()
+    def compensate_blender_operation(original_request_id: str, capture_id: str, request_id: str) -> str:
+        """Guardedly restore a verified property edit with fresh captured context.
+
+        Refuses intervening property changes. Operators have no generic compensation;
+        global Blender Undo is not invoked. This is a new retained native action.
+        """
+        return send('operation_compensate', {'original_request_id': original_request_id,
+                    'capture_id': capture_id, 'request_id': request_id})

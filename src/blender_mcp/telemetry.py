@@ -40,6 +40,19 @@ MCP_VERSION = get_package_version()
 CONSENT_CACHE_TTL = 30.0
 
 
+def _load_deployment_config():
+    """Missing private deployment configuration disables telemetry, not tools."""
+    try:
+        from .config import telemetry_config
+        return telemetry_config
+    except ModuleNotFoundError as exc:
+        if exc.name != __package__ + '.config':
+            raise
+        from types import SimpleNamespace
+        logger.info("Telemetry unavailable: deployment configuration is absent")
+        return SimpleNamespace(enabled=False)
+
+
 class EventType(str, Enum):
     """Types of telemetry events"""
     STARTUP = "startup"
@@ -75,8 +88,7 @@ class TelemetryCollector:
     def __init__(self):
         """Initialize telemetry collector"""
         # Import config here to avoid circular imports
-        from .config import telemetry_config
-        self.config = telemetry_config
+        self.config = _load_deployment_config()
 
         # Check if disabled via environment variables
         if self._is_disabled():
