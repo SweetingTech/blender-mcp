@@ -86,6 +86,7 @@ def _load_server_class():
         "_register_edit_capture_handlers": lambda: False,
         "_unregister_edit_capture_handlers": lambda: None,
         "get_edit_recorder": lambda: _NullEditRecorder(),
+        "_live_editor_context": types.SimpleNamespace(invalidate=lambda: None, sample=lambda ctx: None),
     }
     exec(compile(ast.Module(body=body, type_ignores=[]), "<addon>", "exec"), namespace)
     return namespace["BlenderMCPServer"], registered

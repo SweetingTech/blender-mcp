@@ -796,6 +796,14 @@ The system uses a simple JSON-based protocol over TCP sockets:
 
 ## Telemetry Control
 
+### Shared editor context in this fork
+
+This fork adds a generic companion interface for live workspace/editor context,
+native entity/RNA/operator discovery, guarded native property and operator actions,
+and retained outcome/readback/compensation. See
+[the workflow, supported coverage and test boundaries](docs/SHARED_EDITOR_CONTEXT.md).
+The feature does not claim every Blender control; companion permissions default off.
+
 Telemetry is **opt-in**. Collection of your content is off by default and stays off until you explicitly turn it on.
 
 **What is collected by default (no opt-in):** a minimal anonymous usage record so I can count active users and see which tools get used — a randomly generated install ID, a session ID, the tool name, whether it succeeded, how long it took, the MCP for Blender and Blender versions, your operating system, and a timestamp.

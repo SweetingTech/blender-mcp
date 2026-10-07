@@ -87,6 +87,7 @@ def _load_autostart_helpers():
         "socket": socket,
         "persistent": lambda fn: fn,
         "BlenderMCPServer": _Server,
+        "_live_editor_context": types.SimpleNamespace(invalidate=lambda: None),
         "_user_stopped_server": False,
     }
     exec(  # noqa: S102 - execute only the selected functions from our own source.

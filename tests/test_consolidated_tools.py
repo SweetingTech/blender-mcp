@@ -10,6 +10,9 @@ from blender_mcp.openai_apps import is_app_only
 MODEL_TOOLS = {
     "get_addon_status", "disable_telemetry", "get_scene_info", "execute_blender_code",
     "record_trajectory_feedback", "look", "generate_3d", "search_assets", "import_asset",
+    "inspect_blender_workspace", "capture_blender_context", "resolve_blender_context",
+    "release_blender_context", "inspect_blender_entity", "discover_blender_capabilities",
+    "execute_blender_operation", "observe_blender_operation", "compensate_blender_operation",
 }
 
 
