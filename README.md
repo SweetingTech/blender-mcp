@@ -796,6 +796,13 @@ The system uses a simple JSON-based protocol over TCP sockets:
 
 ## Telemetry Control
 
+### Shared editor context in this fork
+
+This fork adds explicit captured bone context, native RNA discovery, guarded
+pose/edit-bone transforms and receipt-based compensation. See
+[the workflow, supported coverage and test boundaries](docs/SHARED_EDITOR_CONTEXT.md).
+The feature does not expose every Blender control; scoped bone edits default off.
+
 Telemetry is **opt-in**. Collection of your content is off by default and stays off until you explicitly turn it on.
 
 **What is collected by default (no opt-in):** a minimal anonymous usage record so I can count active users and see which tools get used — a randomly generated install ID, a session ID, the tool name, whether it succeeded, how long it took, the MCP for Blender and Blender versions, your operating system, and a timestamp.

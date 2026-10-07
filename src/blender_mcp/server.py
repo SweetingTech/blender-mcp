@@ -357,6 +357,11 @@ mcp = FastMCP(
     instructions=SERVER_INSTRUCTIONS,
 )
 
+# Late-bound connection keeps imports side-effect-free and supports older add-ons
+# with explicit unsupported-command errors rather than Python fallback execution.
+from .live_context_tools import register as register_live_context_tools
+register_live_context_tools(mcp, lambda: get_blender_connection())
+
 # Resource endpoints
 
 # Global connection for resources (since resources can't access context)

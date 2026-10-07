@@ -4,6 +4,7 @@ import re
 import textwrap
 import bpy
 import mathutils
+import math
 import json
 import threading
 import socket
@@ -27,6 +28,276 @@ from urllib.parse import quote, urlencode, urlparse, urlunparse, parse_qsl
 from contextlib import contextmanager, redirect_stdout, suppress
 from bpy.app.handlers import persistent
 
+class LiveEditorContext:
+    """Main-thread, session-only selection captures and guarded bone edits.
+
+    Names are labels, not identity. Captures retain pointer identities, a document
+    epoch and a selection serial. No RNA references survive a sample or edit.
+    """
+
+    LIMIT = 32
+
+    def __init__(self):
+        self.epoch = uuid.uuid4().hex
+        self.serial = 0
+        self.document = None
+        self.signature = None
+        self.captures = {}
+        self.receipts = {}
+        self.requests = {}
+
+    @staticmethod
+    def _digest(value):
+        return hashlib.sha256(json.dumps(value, sort_keys=True, allow_nan=False).encode()).hexdigest()
+
+    @staticmethod
+    def _copy(value):
+        return json.loads(json.dumps(value, allow_nan=False))
+
+    @staticmethod
+    def _error(code):
+        raise ValueError(code)
+
+    def invalidate(self):
+        self.epoch = uuid.uuid4().hex
+        self.document = self.signature = None
+        self.captures.clear()
+        self.receipts.clear()
+        self.requests.clear()
+
+    def sample(self, context):
+        scene = context.scene
+        obj = context.view_layer.objects.active
+        document = (bpy.data.filepath, scene.as_pointer(), context.view_layer.as_pointer())
+        if self.document is not None and document != self.document:
+            self.invalidate()
+        self.document = document
+        mode = context.mode
+        selected = sorted((o.name, o.as_pointer()) for o in context.selected_objects)
+        bones, active = [], None
+        if obj is not None and obj.type == 'ARMATURE':
+            collection = obj.data.edit_bones if mode == 'EDIT_ARMATURE' else obj.data.bones
+            bones = sorted((b.name, b.as_pointer()) for b in collection if b.select)
+            active = collection.active
+        target = None
+        if active is not None and active.select and mode in {'POSE', 'EDIT_ARMATURE'}:
+            target = {'kind': 'pose_bone' if mode == 'POSE' else 'edit_bone',
+                      'object': obj.name, 'object_identity': obj.as_pointer(),
+                      'armature_identity': obj.data.as_pointer(),
+                      'bone': active.name, 'bone_identity': active.as_pointer()}
+        signature = (document, mode, None if obj is None else (obj.name, obj.as_pointer()), selected, bones,
+                     None if active is None else (active.name, active.as_pointer()))
+        signature = self._copy(signature)
+        if signature != self.signature:
+            self.serial += 1
+            self.signature = signature
+        state = {'epoch': self.epoch, 'selection_serial': self.serial,
+                 'file': bpy.data.filepath, 'scene': scene.name, 'mode': mode,
+                 'scene_identity': scene.as_pointer(), 'view_layer': context.view_layer.name,
+                 'active_object': None if obj is None else obj.name,
+                 'selected_objects': [name for name, _ in selected],
+                 'selected_bones': [name for name, _ in bones], 'target': target,
+                 'scoped_bone_edits_enabled': bool(getattr(scene, 'blendermcp_allow_bone_edits', False)),
+                 'supported': ['object_selection', 'active_armature_bone', 'pose_location', 'edit_head_tail_roll'],
+                 'unsupported': ['mesh_subelements', 'focused_property', 'all_ui_controls', 'node_selection',
+                                 'utterance_timing', 'bone_rotation_scale', 'multi_object_armature_edit']}
+        if len([o for o in context.selected_objects if o.type == 'ARMATURE']) > 1:
+            state['target'] = None
+        if target is not None and state['target'] is not None:
+            _, bone = self.resolve(target, mode)
+            state['bone_state'] = self.read_bone(bone, mode)
+            state['bone_digest'] = self._digest(state['bone_state'])
+            state['bone_context'] = {
+                'parent': None if bone.parent is None else bone.parent.name,
+                'length': float(bone.length),
+                'constraints': [constraint.type for constraint in getattr(bone, 'constraints', ())],
+                'space': 'pose_local_channels' if mode == 'POSE' else 'armature_local',
+                'unit_scale': float(scene.unit_settings.scale_length),
+            }
+        return state
+
+    def observe(self, context, capture_id=None):
+        current = self.sample(context)
+        if capture_id is None:
+            return {'current': current, 'latest_capture_id': next(reversed(self.captures), None)}
+        captured = self.captures.get(capture_id)
+        if captured is None:
+            self._error('CAPTURE_NOT_FOUND')
+        return {'capture': self._copy(captured), 'current': current,
+                'stale': captured['epoch'] != current['epoch'] or
+                         captured['selection_serial'] != current['selection_serial'] or
+                         captured.get('bone_digest') != current.get('bone_digest')}
+
+    def capture(self, context, source='agent_request'):
+        state = self.sample(context)
+        if state['target'] is None:
+            self._error('SELECT_ONE_ACTIVE_ARMATURE_BONE')
+        if len(self.captures) >= self.LIMIT:
+            self._error('CAPTURE_CAPACITY_RELEASE_OR_RESTART')
+        capture_id = uuid.uuid4().hex
+        state.update(capture_id=capture_id, source=source, captured_at=time.time())
+        area = getattr(context, 'area', None)
+        state['editor'] = None if area is None else {'type': area.type, 'identity': area.as_pointer()}
+        window = getattr(context, 'window', None)
+        state['window_identity'] = None if window is None else window.as_pointer()
+        region_data = getattr(context, 'region_data', None)
+        # A sidebar invocation may not carry WINDOW region data. Never substitute
+        # another viewport and call it the user's current view.
+        state['view'] = None if region_data is None else {
+            'view_matrix': [list(row) for row in region_data.view_matrix],
+            'perspective_matrix': [list(row) for row in region_data.perspective_matrix],
+        }
+        self.captures[capture_id] = self._copy(state)
+        return self._copy(state)
+
+    def release(self, capture_id):
+        if capture_id not in self.captures:
+            self._error('CAPTURE_NOT_FOUND')
+        del self.captures[capture_id]
+        return {'released': capture_id}
+
+    def resolve(self, target, mode):
+        obj = bpy.data.objects.get(target['object'])
+        if (obj is None or obj.type != 'ARMATURE' or obj.as_pointer() != target['object_identity'] or
+                obj.data.as_pointer() != target['armature_identity']):
+            self._error('TARGET_IDENTITY_CHANGED')
+        identity_collection = obj.data.edit_bones if mode == 'EDIT_ARMATURE' else obj.data.bones
+        identity = identity_collection.get(target['bone'])
+        if identity is None or identity.as_pointer() != target['bone_identity']:
+            self._error('TARGET_IDENTITY_CHANGED')
+        bone = obj.pose.bones.get(target['bone']) if mode == 'POSE' else identity
+        return obj, bone
+
+    @staticmethod
+    def read_bone(bone, mode):
+        if mode == 'POSE':
+            return {'location': list(bone.location)}
+        return {'head': list(bone.head), 'tail': list(bone.tail), 'roll': float(bone.roll)}
+
+    def validate_transform(self, transform, mode):
+        allowed = {'location'} if mode == 'POSE' else {'head', 'tail', 'roll'}
+        if not isinstance(transform, dict) or not transform or set(transform) - allowed:
+            self._error('UNSUPPORTED_TRANSFORM_FIELDS')
+        out = {}
+        for name, value in transform.items():
+            if name == 'roll':
+                values = [value]
+            else:
+                if not isinstance(value, list) or len(value) != 3:
+                    self._error('INVALID_VECTOR')
+                values = value
+            if any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or abs(v) > 1e6 for v in values):
+                self._error('INVALID_TRANSFORM_VALUE')
+            out[name] = float(value) if name == 'roll' else [float(v) for v in value]
+        return out
+
+    def _request(self, request_id, body):
+        if not isinstance(request_id, str) or not 1 <= len(request_id) <= 128:
+            self._error('REQUEST_ID_REQUIRED')
+        digest = self._digest(body)
+        previous = self.requests.get(request_id)
+        if previous is not None:
+            if previous['hash'] != digest:
+                self._error('REQUEST_ID_REUSED')
+            if previous.get('result') is None:
+                self._error('ORIGINAL_OUTCOME_UNKNOWN')
+            return digest, self._copy(previous['result'])
+        if len(self.requests) >= 64:
+            self._error('REQUEST_CAPACITY_RESTART_SESSION')
+        return digest, None
+
+    def apply(self, context, capture_id, expected_digest, transform, request_id):
+        digest, duplicate = self._request(request_id, {'capture_id': capture_id, 'expected_digest': expected_digest,
+                                                       'transform': transform})
+        if duplicate is not None:
+            return duplicate
+        current = self.sample(context)
+        captured = self.captures.get(capture_id)
+        if captured is None:
+            self._error('CAPTURE_NOT_FOUND')
+        if not current['scoped_bone_edits_enabled']:
+            self._error('SCOPED_BONE_EDITS_DISABLED')
+        if captured['epoch'] != current['epoch']:
+            self._error('DOCUMENT_CHANGED')
+        if captured['mode'] != current['mode']:
+            self._error('MODE_CHANGED')
+        if captured['selection_serial'] != current['selection_serial'] or captured['target'] != current['target']:
+            self._error('SELECTION_CHANGED')
+        if expected_digest != captured.get('bone_digest') or expected_digest != current.get('bone_digest'):
+            self._error('BONE_STATE_CHANGED')
+        mode = captured['mode']
+        changes = self.validate_transform(transform, mode)
+        obj, bone = self.resolve(captured['target'], mode)
+        if getattr(obj, 'library', None) or getattr(obj.data, 'library', None) or obj.data.users > 1:
+            self._error('LINKED_OR_SHARED_ARMATURE_UNSUPPORTED')
+        if getattr(obj, 'animation_data', None) or getattr(obj.data, 'animation_data', None):
+            self._error('ANIMATED_ARMATURE_UNSUPPORTED')
+        before = self.read_bone(bone, mode)
+        desired = dict(before, **changes)
+        if mode == 'EDIT_ARMATURE':
+            if bone.use_connect or any(child.use_connect for child in bone.children):
+                self._error('CONNECTED_EDIT_BONE_UNSUPPORTED')
+            if sum((a - b) ** 2 for a, b in zip(desired['head'], desired['tail'])) < 1e-12:
+                self._error('ZERO_LENGTH_BONE')
+        elif bone.constraints or any(bone.lock_location):
+            self._error('CONSTRAINED_OR_LOCKED_BONE_UNSUPPORTED')
+        self.requests[request_id] = {'hash': digest, 'result': None}
+        try:
+            for name, value in changes.items():
+                setattr(bone, name, value)
+            context.view_layer.update()
+            after = self.read_bone(bone, mode)
+            verified = all(abs(a - b) <= 1e-5 for name in desired for a, b in
+                           zip([after[name]] if name == 'roll' else after[name],
+                               [desired[name]] if name == 'roll' else desired[name]))
+            if not verified:
+                self._error('READBACK_MISMATCH')
+        except Exception:
+            for name, value in before.items():
+                setattr(bone, name, value)
+            context.view_layer.update()
+            raise
+        receipt_id = uuid.uuid4().hex
+        result = {'receipt_id': receipt_id, 'capture_id': capture_id, 'request_id': request_id,
+                  'target': captured['target'], 'before': before, 'after': after,
+                  'before_digest': self._digest(before), 'after_digest': self._digest(after),
+                  'verified': True, 'scope': 'native_property_readback', 'epoch': self.epoch,
+                  'mode': mode, 'selection_serial': self.serial}
+        self.receipts[receipt_id] = self._copy(result)
+        self.requests[request_id]['result'] = self._copy(result)
+        return self._copy(result)
+
+    def undo(self, context, receipt_id, request_id):
+        digest, duplicate = self._request(request_id, {'undo_receipt_id': receipt_id})
+        if duplicate is not None:
+            return duplicate
+        receipt = self.receipts.get(receipt_id)
+        if receipt is None:
+            self._error('RECEIPT_NOT_FOUND')
+        current = self.sample(context)
+        if (receipt['epoch'] != current['epoch'] or receipt['mode'] != current['mode'] or
+                receipt['selection_serial'] != current['selection_serial'] or receipt['target'] != current['target']):
+            self._error('UNDO_CONTEXT_CHANGED')
+        if receipt['after_digest'] != current.get('bone_digest'):
+            self._error('UNDO_STATE_CHANGED')
+        # Compensation is a new guarded write, never a global Blender undo.
+        captured = self.capture(context, source='compensation')
+        try:
+            result = self.apply(context, captured['capture_id'], captured['bone_digest'], receipt['before'], request_id)
+        finally:
+            self.release(captured['capture_id'])
+            # Preserve the original undo request identity even if compensation
+            # failed after admission. It must never be redispatched on a retry.
+            if request_id in self.requests:
+                self.requests[request_id]['hash'] = digest
+        self.requests[request_id]['hash'] = digest
+        result['compensates'] = receipt_id
+        self.requests[request_id]['result'] = self._copy(result)
+        return result
+
+
+_live_editor_context = LiveEditorContext()
+
 bl_info = {
     "name": "MCP for Blender",
     "author": "Siddharth Ahuja",
@@ -39,7 +310,7 @@ bl_info = {
 }
 
 # Keep in sync with blender_mcp.addon_manager.EXPECTED_ADDON_PROTOCOL_VERSION.
-ADDON_PROTOCOL_VERSION = 13
+ADDON_PROTOCOL_VERSION = 14
 
 # Per-snapshot object cap for get_world_state_snapshot. Keep in sync with
 # blender_mcp.trajectory.MAX_SNAPSHOT_OBJECTS.
@@ -122,6 +393,7 @@ def _blendermcp_schedule_auto_start(delay=0.5):
 
 @persistent
 def _blendermcp_load_post(_unused):
+    _live_editor_context.invalidate()
     """Retry auto-start after Blender loads a startup file or another blend."""
     _blendermcp_schedule_auto_start()
 
@@ -1302,6 +1574,7 @@ class BlenderMCPServer:
             self.stop()
 
     def stop(self):
+        _live_editor_context.invalidate()
         self.running = False
 
         _unregister_edit_capture_handlers()
@@ -1397,6 +1670,11 @@ class BlenderMCPServer:
         """
         if not self.running:
             return None
+
+        try:
+            _live_editor_context.sample(bpy.context)
+        except Exception:
+            pass  # A startup/file-load transition can temporarily lack context.
 
         while True:
             try:
@@ -1506,6 +1784,11 @@ class BlenderMCPServer:
             "list_scene_items": self.list_scene_items,
             "get_viewport_screenshot": self.get_viewport_screenshot,
             "pick_viewport_object": self.pick_viewport_object,
+            "get_editor_context": lambda capture_id=None: _live_editor_context.observe(bpy.context, capture_id),
+            "capture_editor_context": lambda: _live_editor_context.capture(bpy.context),
+            "release_editor_context": _live_editor_context.release,
+            "apply_bone_transform": lambda **args: _live_editor_context.apply(bpy.context, **args),
+            "undo_bone_transform": lambda **args: _live_editor_context.undo(bpy.context, **args),
             "execute_code": self.execute_code,
             "describe_node_type": self.describe_node_type,
             "bpy_api_lookup": self.bpy_api_lookup,
@@ -1603,6 +1886,8 @@ class BlenderMCPServer:
                 "execute_code",
                 "describe_node_type",
                 "bpy_api_lookup",
+                "get_editor_context", "capture_editor_context", "release_editor_context",
+                "apply_bone_transform", "undo_bone_transform",
                 "drain_human_activity",
                 "get_telemetry_consent",
                 "set_telemetry_consent",
@@ -5845,6 +6130,21 @@ class BLENDERMCP_AddonPreferences(bpy.types.AddonPreferences):
         cred_box.prop(self, "polypizza_api_key", text="Poly Pizza API Key")
 
 # Blender UI Panel
+class BLENDERMCP_OT_CaptureContext(bpy.types.Operator):
+    bl_idname = "blendermcp.capture_context"
+    bl_label = "Capture selected bone for AI"
+    bl_description = "Pin the current bone selection; tell the AI to use this capture ID"
+
+    def execute(self, context):
+        try:
+            captured = _live_editor_context.capture(context, source='human_button')
+        except Exception as exc:
+            self.report({'WARNING'}, str(exc))
+            return {'CANCELLED'}
+        self.report({'INFO'}, "Captured bone: " + captured['target']['bone'])
+        return {'FINISHED'}
+
+
 class BLENDERMCP_PT_Panel(bpy.types.Panel):
     bl_label = "MCP for Blender"
     bl_idname = "BLENDERMCP_PT_Panel"
@@ -5878,6 +6178,15 @@ class BLENDERMCP_PT_Panel(bpy.types.Panel):
             col.label(text="Not connected", icon='RADIOBUT_OFF')
             col.prop(scene, "blendermcp_port")
             col.operator("blendermcp.start_server", text="Connect to MCP server", icon='PLAY')
+
+        box = layout.box()
+        box.label(text="Shared editor context")
+        box.operator("blendermcp.capture_context", text="Capture selected bone for AI")
+        capture_id = next(reversed(_live_editor_context.captures), None)
+        if capture_id:
+            box.label(text="Capture: " + capture_id)
+        box.prop(scene, "blendermcp_allow_bone_edits")
+        box.label(text="Scoped edits only; raw Python is separate.")
 
         # Asset libraries
         layout.separator()
@@ -6213,6 +6522,10 @@ class BLENDERMCP_OT_OpenTerms(bpy.types.Operator):
 
 # Registration functions
 def register():
+    bpy.types.Scene.blendermcp_allow_bone_edits = bpy.props.BoolProperty(
+        name="Allow captured bone edits", default=False, options={'SKIP_SAVE'},
+        description="Permit guarded pose location/edit bone head-tail-roll changes for this session")
+    bpy.utils.register_class(BLENDERMCP_OT_CaptureContext)
     bpy.types.Scene.blendermcp_port = IntProperty(
         name="Port",
         description="Port for the MCP for Blender server",
@@ -6389,6 +6702,9 @@ def register():
     print("BlenderMCP addon registered")
 
 def unregister():
+    _live_editor_context.invalidate()
+    bpy.utils.unregister_class(BLENDERMCP_OT_CaptureContext)
+    del bpy.types.Scene.blendermcp_allow_bone_edits
     _blendermcp_unregister_auto_start()
 
     _unregister_edit_capture_handlers()
