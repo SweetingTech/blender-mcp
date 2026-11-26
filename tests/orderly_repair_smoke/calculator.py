@@ -3,5 +3,5 @@ def clamp(value, lower, upper):
     if value < lower:
         return lower
     if value > upper:
-        return lower
+        return upper
     return value
